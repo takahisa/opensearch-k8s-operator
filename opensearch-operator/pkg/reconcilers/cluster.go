@@ -22,6 +22,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -491,16 +492,33 @@ func (r *ClusterReconciler) checkForEmptyDirRecovery() (*ctrl.Result, error) {
 }
 
 func (r *ClusterReconciler) handlePDB(nodePool *opensearchv1.NodePool) (*ctrl.Result, error) {
-	pdb := policyv1.PodDisruptionBudget{}
+	pdb := policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       r.instance.Name + "-" + nodePool.Component + "-pdb",
+			Namespace:  r.instance.Namespace,
+			Finalizers: r.instance.Finalizers,
+		},
+	}
 
 	if nodePool.Pdb != nil && nodePool.Pdb.Enable {
-		// Check if provided parameters are valid
-		if (nodePool.Pdb.MinAvailable != nil && nodePool.Pdb.MaxUnavailable != nil) || (nodePool.Pdb.MinAvailable == nil && nodePool.Pdb.MaxUnavailable == nil) {
-			r.logger.Info("Please provide only one parameter (minAvailable OR maxUnavailable) in order to configure a PodDisruptionBudget")
-			return &ctrl.Result{}, fmt.Errorf("please provide only one parameter (minAvailable OR maxUnavailable) in order to configure a PodDisruptionBudget")
-
+		switch {
+		case nodePool.Pdb.MinAvailable != nil && nodePool.Pdb.MaxUnavailable != nil:
+			r.logger.Info("minAvailable and maxUnavailable are mutually exclusive")
+			return &ctrl.Result{}, fmt.Errorf("minAvailable and maxUnavailable are mutually exclusive")
+		case nodePool.Pdb.MinAvailable != nil:
+			pdb.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: nodePool.Pdb.MinAvailable.IntVal}
+		case nodePool.Pdb.MaxUnavailable != nil:
+			pdb.Spec.MaxUnavailable = &intstr.IntOrString{Type: intstr.Int, IntVal: nodePool.Pdb.MaxUnavailable.IntVal}
+		default:
+			health, healthResponse := util.GetClusterHealth(r.client, r.ctx, r.instance, r.logger)
+			if (health == opensearchv1.OpenSearchGreenHealth) &&
+				(healthResponse.UnassignedShards == 0) &&
+				(healthResponse.RelocatingShards == 0) {
+				pdb.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: nodePool.Replicas - 1}
+			} else {
+				pdb.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: nodePool.Replicas}
+			}
 		}
-		pdb = helpers.ComposePDB(r.instance, nodePool)
 		if err := ctrl.SetControllerReference(r.instance, &pdb, r.client.Scheme()); err != nil {
 			return &ctrl.Result{}, err
 		}
@@ -508,13 +526,6 @@ func (r *ClusterReconciler) handlePDB(nodePool *opensearchv1.NodePool) (*ctrl.Re
 		return r.client.ReconcileResource(&pdb, reconciler.StatePresent)
 	} else {
 		// Make sure any existing PDB is removed if the feature is not enabled
-		pdb = policyv1.PodDisruptionBudget{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:       r.instance.Name + "-" + nodePool.Component + "-pdb",
-				Namespace:  r.instance.Namespace,
-				Finalizers: r.instance.Finalizers,
-			},
-		}
 		return r.client.ReconcileResource(&pdb, reconciler.StateAbsent)
 	}
 }
